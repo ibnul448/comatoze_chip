@@ -1,0 +1,34 @@
+name: build-comatoze-zygisk
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Susun folder build
+        run: |
+          mkdir -p zygisk-src/jni
+          cp module.cpp lookup.h Android.mk Application.mk zygisk-src/jni/
+          curl -fsSL -o zygisk-src/jni/zygisk.hpp \
+            https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
+
+      - name: Build dengan NDK
+        run: |
+          "$ANDROID_NDK_LATEST_HOME/ndk-build" -C zygisk-src
+
+      - name: Kemas modul Comatoze + Zygisk
+        run: |
+          mkdir module
+          unzip -q Comatoze-module.zip -d module
+          mkdir -p module/zygisk
+          cp zygisk-src/libs/arm64-v8a/libcomatoze_zygisk.so   module/zygisk/arm64-v8a.so
+          cp zygisk-src/libs/armeabi-v7a/libcomatoze_zygisk.so module/zygisk/armeabi-v7a.so
+          cd module && zip -r -X ../Comatoze-v2_23_0-beta-zygisk.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Comatoze-zygisk
+          path: Comatoze-v2_23_0-beta-zygisk.zip
