@@ -55,7 +55,7 @@ static void companion_handler(int fd) {
     std::string out;
     if (access(kConfig, R_OK) != 0) LOGI("companion: config tidak terbaca (%s)", kConfig);
     if (comatoze_lookup(kConfig, proc, si))
-        out = si.man + "\n" + si.model + "\n" + (si.full ? "1" : "0") + "\n" + si.hw + "\n" + si.board + "\n" + si.socman + "\n" + si.socmodel;
+        out = si.man + "\n" + si.model + "\n" + (si.full ? "1" : "0") + "\n" + si.hw + "\n" + si.board + "\n" + si.socman + "\n" + si.socmodel + "\n" + (si.props ? "1" : "0");
     LOGI("companion: %s -> %s", proc.c_str(), out.empty() ? "miss" : "HIT");
     uint32_t m = static_cast<uint32_t>(out.size());
     write_full(fd, &m, sizeof(m));
@@ -75,6 +75,39 @@ static void set_build_field(JNIEnv *env, jclass cls, const char *name, const std
     }
     env->SetStaticObjectField(cls, f, s);
     env->DeleteLocalRef(s);
+}
+
+
+// ---- sadap properti sistem versi Java: android.os.SystemProperties.native_get(String key, String def) ----
+// Hanya untuk app yang diaktifkan ("Properti" di WebUI). Menutup pembacaan lewat Java/reflection; TIDAK menutup
+// getprop (proses lain) maupun pembacaan native langsung (__system_property_get) oleh engine game.
+static std::string g_hw, g_board, g_socman, g_socmodel;
+static jstring (*orig_native_get)(JNIEnv *, jclass, jstring, jstring) = nullptr;
+
+static bool spoof_prop(const char *k, std::string &v) {
+    struct { const char *key; const std::string *val; } t[] = {
+        {"ro.soc.model", &g_socmodel},   {"ro.soc.manufacturer", &g_socman},   {"ro.board.platform", &g_board},
+        {"ro.product.board", &g_board},  {"ro.hardware", &g_hw},               {"ro.boot.hardware", &g_hw},
+        {"ro.hardware.chipname", &g_socmodel}};
+    for (auto &e : t)
+        if (!strcmp(k, e.key) && !e.val->empty()) { v = *e.val; return true; }
+    if (!strcmp(k, "ro.mediatek.platform") && g_socman == "Mediatek" && !g_socmodel.empty()) { v = g_socmodel; return true; }
+    return false;
+}
+
+static jstring hook_native_get(JNIEnv *env, jclass clazz, jstring key, jstring def) {
+    if (key) {
+        const char *k = env->GetStringUTFChars(key, nullptr);
+        std::string v;
+        bool hit = k && spoof_prop(k, v);
+        if (k) env->ReleaseStringUTFChars(key, k);
+        if (hit) {
+            jstring r = env->NewStringUTF(v.c_str());
+            if (r) return r;
+            env->ExceptionClear();
+        }
+    }
+    return orig_native_get ? orig_native_get(env, clazz, key, def) : def;
 }
 
 class ComatozeZ : public zygisk::ModuleBase {
@@ -122,6 +155,7 @@ public:
         model_ = parts[1];
         full_ = (parts[2] == "1");
         if (parts.size() >= 7) { hw_ = parts[3]; board_ = parts[4]; socman_ = parts[5]; socmodel_ = parts[6]; }
+        if (parts.size() >= 8) props_ = (parts[7] == "1");
         if (man_.empty() || model_.empty()) return unload();
         apply_ = true;
         proc_ = proc;
@@ -146,16 +180,27 @@ public:
         if (!socman_.empty()) set_build_field(env_, cls, "SOC_MANUFACTURER", socman_);  // Android 12+ (field tidak ada di versi lama: dilewati)
         if (!socmodel_.empty()) set_build_field(env_, cls, "SOC_MODEL", socmodel_);
         env_->DeleteLocalRef(cls);
-        LOGI("spoof %s -> %s %s%s%s%s", proc_.c_str(), man_.c_str(), model_.c_str(), full_ ? " (lengkap)" : "", socmodel_.empty() ? "" : " chip ", socmodel_.c_str());
+        bool hooked = false;
+        if (props_ && (!hw_.empty() || !board_.empty() || !socman_.empty() || !socmodel_.empty())) hooked = install_prop_hook();
+        LOGI("spoof %s -> %s %s%s%s%s%s", proc_.c_str(), man_.c_str(), model_.c_str(), full_ ? " (lengkap)" : "", socmodel_.empty() ? "" : " chip ", socmodel_.c_str(), props_ ? (hooked ? " +props" : " +props(GAGAL)") : "");
     }
 
 private:
+    bool install_prop_hook() {
+        g_hw = hw_; g_board = board_; g_socman = socman_; g_socmodel = socmodel_;
+        JNINativeMethod methods[] = {{"native_get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(hook_native_get)}};
+        api_->hookJniNativeMethods(env_, "android/os/SystemProperties", methods, 1);
+        if (env_->ExceptionCheck()) env_->ExceptionClear();
+        orig_native_get = reinterpret_cast<decltype(orig_native_get)>(methods[0].fnPtr);  // diisi pointer asli oleh Zygisk
+        return orig_native_get != nullptr;                                                 // null = metode tidak ditemukan: hook tidak aktif
+    }
     void unload() { api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY); }
 
     zygisk::Api *api_ = nullptr;
     JNIEnv *env_ = nullptr;
     bool apply_ = false;
     bool full_ = false;
+    bool props_ = false;
     std::string man_, model_, proc_, hw_, board_, socman_, socmodel_;
 };
 
